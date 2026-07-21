@@ -9,8 +9,8 @@ Implements the HEURISTICS render pipeline in the correct order:
      and applies `subtitles` filter LAST → final.mp4
 
 Optionally builds a master SRT from the per-source transcripts + EDL
-output-timeline offsets, applies the proven force_style (2-word
-UPPERCASE chunks, Helvetica 18 Bold, MarginV=35).
+output-timeline offsets — one full sentence / idea per caption cue, natural
+case — and burns it with force_style (Helvetica Bold, high-contrast box).
 
 Usage:
     python helpers/render.py <edl.json> -o final.mp4
@@ -38,21 +38,27 @@ except Exception:
         return "eq=contrast=1.03:saturation=0.98", {}
 
 
-# -------- Subtitle style (bold-overlay, proven at 1920×1080 and 1080×1920) --
+# -------- Subtitle style (phrase-style TikTok captions) ----------------------
+#
+# Captions should read one clean phrase at a time, usually 3–5 words per cue,
+# in natural case — not all-caps walls. The default uses TikTok Sans Bold with
+# no background box and no black letter outline. If the footage requires extra
+# contrast, make that an explicit taste decision instead of silently changing
+# the default.
 #
 # MarginV is NOT taste — it is a platform safe-zone rule.
 # TikTok / IG Reels / Shorts UI (caption, username, music, right-rail actions)
 # covers roughly the bottom ~25–30% of a 1080×1920 frame. Captions placed near
 # the bottom edge get clipped or obscured by the UI. libass auto-scales the
-# render canvas relative to PlayResY=288, so MarginV=90 lands the caption
-# baseline roughly 30% up from the bottom on any aspect — clear of the UI on
-# every major vertical-video platform. Do not drop this below ~75 without a
-# specific reason.
+# render canvas relative to PlayResY=288, so MarginV=80 lands the caption box
+# clear of the UI on every major vertical-video platform. Drop it lower (~34)
+# for landscape / desktop deliverables. Do not drop below ~75 for vertical
+# social without a specific reason.
 SUB_FORCE_STYLE = (
-    "FontName=Helvetica,FontSize=18,Bold=1,"
+    "FontName=TikTok Sans,FontSize=18,Bold=1,"
     "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H00000000,"
-    "BorderStyle=1,Outline=2,Shadow=0,"
-    "Alignment=2,MarginV=90"
+    "BorderStyle=1,Outline=0,Shadow=0,"
+    "Alignment=2,MarginV=80"
 )
 
 # -------- Helpers ------------------------------------------------------------
@@ -208,7 +214,11 @@ def extract_segment(
         "-movflags", "+faststart",
         str(out_path),
     ]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    # ffmpeg can emit enough progress/warning output to fill stderr and block
+    # when it is captured but never read, especially on long phone-video HEVC
+    # talking-head segments. This helper does not need that stream unless the
+    # command fails, so discard it to keep renders moving.
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def extract_all_segments(
@@ -288,6 +298,77 @@ def concat_segments(segment_paths: list[Path], out_path: Path, edit_dir: Path) -
 
 PUNCT_BREAK = set(".,!?;:")
 
+# Caption chunking: one clean phrase at a time.
+# Default target is 3–5 words per cue. Prefer punctuation and clause boundaries
+# when they land inside that window; otherwise split at the cap while avoiding
+# dangling connectors at the end of a line. Natural case — never all-caps walls.
+SENT_END = set(".!?")
+CLAUSE_END = set(",;:")
+CUE_MIN_WORDS = 3
+CUE_MAX_WORDS = 5
+CUE_MAX_CHARS = 34
+# When a forced (no-clause) split would end on one of these connectors, back up
+# so the connector starts the next cue instead of dangling at the end of a line.
+TRAILING_STOPWORDS = {
+    "a", "an", "the", "to", "of", "and", "or", "in", "into", "on", "for",
+    "with", "that", "is", "was", "as", "at", "by", "but", "so", "my", "your",
+}
+
+
+def _group_into_cues(words: list[dict]) -> list[list[dict]]:
+    """Group words into phrase-sized caption cues.
+
+    Default caption style is one readable phrase at a time: usually 3–5 words,
+    split on punctuation when it naturally lands in that range, otherwise at the
+    word/character cap. One- or two-word cues are reserved for genuine short
+    sentences like "Why?" or the final tail of a sentence.
+    """
+    cues: list[list[dict]] = []
+    current: list[dict] = []
+    cur_chars = 0
+    for w in words:
+        text = (w.get("text") or "").strip()
+        if not text:
+            continue
+        current.append(w)
+        cur_chars += len(text) + 1
+        last_char = text[-1]
+        if last_char in SENT_END and len(current) < CUE_MIN_WORDS:
+            cues.append(current)
+            current, cur_chars = [], 0
+            continue
+        if len(current) >= CUE_MIN_WORDS and (
+            last_char in SENT_END or last_char in CLAUSE_END or
+            len(current) >= CUE_MAX_WORDS or cur_chars >= CUE_MAX_CHARS
+        ):
+            # Split at the cue cap, but back up so the cue does not end on a
+            # dangling connector when possible.
+            cut = len(current)
+            while cut > CUE_MIN_WORDS and (
+                (current[cut - 1].get("text") or "").strip().lower().strip(".,!?;:")
+                in TRAILING_STOPWORDS
+            ):
+                cut -= 1
+            cues.append(current[:cut])
+            current = current[cut:]
+            cur_chars = sum(len((x.get("text") or "").strip()) + 1 for x in current)
+    if current:
+        cues.append(current)
+    return cues
+
+
+def _cue_text(cue: list[dict]) -> str:
+    """Join a cue's words into readable, natural-case caption text."""
+    text = " ".join((w.get("text") or "").strip() for w in cue)
+    text = re.sub(r"\s+", " ", text).strip()
+    # Rejoin tokenizer hyphen splits, e.g. "belief -shifting" -> "belief-shifting".
+    text = re.sub(r"\s+-", "-", text)
+    text = re.sub(r"^-", "", text)
+    # Use a non-breaking hyphen inside words so libass never wraps a hyphenated
+    # word across two lines ("three-step" -> "three" / "-step").
+    text = re.sub(r"(?<=\w)-(?=\w)", "‑", text)
+    return text.strip()
+
 
 def _srt_timestamp(seconds: float) -> str:
     total_ms = int(round(seconds * 1000))
@@ -298,6 +379,13 @@ def _srt_timestamp(seconds: float) -> str:
 
 
 def _words_in_range(transcript: dict, t_start: float, t_end: float) -> list[dict]:
+    """Words acoustically inside [t_start, t_end].
+
+    A tight cut edge can clip a word whose ASR timestamp barely overlaps the
+    range — including it produces dangling caption fragments ("and", "the") at
+    splice boundaries. Require a real overlap (≥ half the word, or ≥ 0.2s) so a
+    word that was actually cut off does not leak into the caption.
+    """
     out: list[dict] = []
     for w in transcript.get("words", []):
         if w.get("type") != "word":
@@ -306,17 +394,23 @@ def _words_in_range(transcript: dict, t_start: float, t_end: float) -> list[dict
         we = w.get("end")
         if ws is None or we is None:
             continue
-        if we <= t_start or ws >= t_end:
+        dur = max(0.0, we - ws)
+        if dur <= 0:
+            # Zero-duration token (ASR artifact): include if its point is inside.
+            if t_start <= ws < t_end:
+                out.append(w)
             continue
-        out.append(w)
+        overlap = min(we, t_end) - max(ws, t_start)
+        if overlap >= min(0.5 * dur, 0.20):
+            out.append(w)
     return out
 
 
 def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
     """Build an output-timeline SRT from per-source transcripts.
 
-    - 2-word chunks (break on any punctuation in between)
-    - UPPERCASE text
+    - One full sentence / idea per caption cue (see _group_into_cues)
+    - Natural case (never all-caps walls)
     - Output times computed as word.start - segment_start + segment_offset
     """
     transcripts_dir = edit_dir / "transcripts"
@@ -340,37 +434,38 @@ def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
         transcript = json.loads(tr_path.read_text())
         words_in_seg = _words_in_range(transcript, seg_start, seg_end)
 
-        # Group into 2-word chunks, break on punctuation
-        chunks: list[list[dict]] = []
-        current: list[dict] = []
-        for w in words_in_seg:
-            text = (w.get("text") or "").strip()
-            if not text:
-                continue
-            current.append(w)
-            # Break if the current text ends in punctuation or we hit 2 words
-            ends_in_punct = bool(text) and text[-1] in PUNCT_BREAK
-            if len(current) >= 2 or ends_in_punct:
-                chunks.append(current)
-                current = []
-        if current:
-            chunks.append(current)
-
-        for chunk in chunks:
-            local_start = max(seg_start, chunk[0].get("start", seg_start))
-            local_end = min(seg_end, chunk[-1].get("end", seg_end))
+        # Group into full sentence / idea cues (no tiny 1-2 word fragments)
+        for cue in _group_into_cues(words_in_seg):
+            local_start = max(seg_start, cue[0].get("start", seg_start))
+            local_end = min(seg_end, cue[-1].get("end", seg_end))
             out_start = max(0.0, local_start - seg_start) + seg_offset
             out_end = max(0.0, local_end - seg_start) + seg_offset
             if out_end <= out_start:
                 out_end = out_start + 0.4
-            text = " ".join((w.get("text") or "").strip() for w in chunk)
-            text = re.sub(r"\s+", " ", text).strip()
-            # Strip trailing punctuation for cleaner uppercase look
-            text = text.rstrip(",;:")
-            text = text.upper()
-            entries.append((out_start, out_end, text))
+            text = _cue_text(cue)
+            if text:
+                entries.append((out_start, out_end, text))
 
         seg_offset += seg_duration
+
+    # Merge a stray 1-word cue into the cue before it, as long as that cue is
+    # the same sentence still in progress (did not end on . ! ?). This folds
+    # splice-boundary tails like "responses." or "through." back into their
+    # sentence instead of flashing a lone word. A genuine 1-word sentence
+    # (previous cue ended with terminal punctuation) is left standing.
+    merged: list[tuple[float, float, str]] = []
+    for start, end, text in entries:
+        if (
+            merged
+            and " " not in text
+            and merged[-1][2][-1:] not in SENT_END
+        ):
+            p_start, _p_end, p_text = merged[-1]
+            joined = re.sub(r"\s+-", "-", f"{p_text} {text}").strip()
+            merged[-1] = (p_start, end, joined)
+        else:
+            merged.append((start, end, text))
+    entries = merged
 
     # Sort and write as SRT
     entries.sort(key=lambda e: e[0])

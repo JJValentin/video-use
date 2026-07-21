@@ -154,6 +154,8 @@ def render_markdown(entries: list[tuple[str, float, list[dict]]], silence_thresh
                 spk_str = str(spk)
                 if spk_str.startswith("speaker_"):
                     spk_str = spk_str[len("speaker_"):]
+                elif spk_str.lower().startswith("speaker "):
+                    spk_str = spk_str.split(None, 1)[1]
                 spk_tag = f" S{spk_str}"
             else:
                 spk_tag = ""

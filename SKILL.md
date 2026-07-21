@@ -1,6 +1,6 @@
 ---
 name: video-use
-description: Edit any video by conversation. Transcribe, cut, color grade, generate overlay animations, burn subtitles — for talking heads, montages, tutorials, travel, interviews. No presets, no menus. Ask questions, confirm the plan, execute, iterate, persist. Production-correctness rules are hard; everything else is artistic freedom.
+description: Edit any video by conversation. Transcribe, cut, color grade, generate overlay animations, burn subtitles — especially creator talking-head/yap videos, plus montages, tutorials, travel, interviews, BTS, and sponsored posts. Finds the thesis, proposes the cut, protects the voice, creates hook variants when useful, executes, verifies, iterates, and persists. Production-correctness rules are hard; everything else is artistic freedom.
 ---
 
 # Video Use
@@ -31,6 +31,7 @@ These are the things where deviation produces silent failures or broken output. 
 10. **Parallel sub-agents for multiple animations.** Never sequential. Spawn N at once via the `Agent` tool; total wall time ≈ slowest one.
 11. **Strategy confirmation before execution.** Never touch the cut until the user has approved the plain-English plan.
 12. **All session outputs in `<videos_dir>/edit/`.** Never write inside the `video-use/` project directory.
+13. **Audio cleanup, music, and SFX run as audio-only passes on the concatenated/composited track — never per-segment.** Video is `-c:v copy` through every audio step. The only per-segment audio operation is the 30ms boundary fade (Rule 3). Loudnorm is ALWAYS the last audio action — run it after music is mixed, because added music changes integrated loudness.
 
 Everything else in this document is a worked example. Deviate whenever the material calls for it.
 
@@ -48,6 +49,7 @@ The skill lives in `video-use/`. User footage lives wherever they put it. All se
     ├── transcripts/<name>.json  ← cached raw Scribe JSON
     ├── animations/slot_<id>/    ← per-animation source + render + reasoning
     ├── clips_graded/            ← per-segment extracts with grade + fades
+    ├── hyperframes/             ← optional HyperFrames visual pass
     ├── master.srt               ← output-timeline subtitles
     ├── downloads/               ← yt-dlp outputs
     ├── verify/                  ← debug frames / timeline PNGs
@@ -59,7 +61,10 @@ The skill lives in `video-use/`. User footage lives wherever they put it. All se
 
 First-time install lives in `install.md` (clone, deps, ffmpeg, skill registration, API key). Don't re-run it every session; on cold start just verify:
 
-- `ELEVENLABS_API_KEY` resolves — either in the environment or in `.env` at the video-use repo root. If missing, ask the user to paste one and write it to `.env` (never to the user's `<videos_dir>`).
+- `TRANSCRIBE_PROVIDER` resolves. This install defaults to `castmagic`.
+- For `TRANSCRIBE_PROVIDER=castmagic`, `CASTMAGIC_API_KEY` resolves from environment or OpenClaw env files. Castmagic needs a public media URL, so local files must have either a `<video>.url` sidecar or an `edit/source_urls.json` mapping before transcription.
+- For `TRANSCRIBE_PROVIDER=local-whisper`, transcription runs locally through `faster-whisper`. It creates word-level timestamps and uses `Speaker 1` for all words because local Whisper does not diarize.
+- For `TRANSCRIBE_PROVIDER=elevenlabs`, `ELEVENLABS_API_KEY` resolves — either in the environment or in `.env` at the video-use repo root. If missing, ask the user to paste one and write it to `.env` (never to the user's `<videos_dir>`).
 - `ffmpeg` + `ffprobe` on PATH.
 - Python deps installed (`uv sync` or `pip install -e .` inside the repo).
 - Node.js + npm available if the session needs HyperFrames or Remotion slots. HyperFrames currently requires Node.js 22+.
@@ -71,33 +76,82 @@ Helpers (`helpers/transcribe.py`, `helpers/render.py`, etc.) live alongside this
 
 ## Helpers
 
-- **`transcribe.py <video>`** — single-file Scribe call. `--num-speakers N` optional. Cached.
-- **`transcribe_batch.py <videos_dir>`** — 4-worker parallel transcription. Use for multi-take.
+- **`transcribe.py <video>`** — single-file transcript call using `TRANSCRIBE_PROVIDER`. `--num-speakers N` optional for ElevenLabs. Cached.
+- **`transcribe_batch.py <videos_dir>`** — 4-worker parallel transcription using `TRANSCRIBE_PROVIDER`. Use for multi-take.
 - **`pack_transcripts.py --edit-dir <dir>`** — `transcripts/*.json` → `takes_packed.md` (phrase-level, break on silence ≥ 0.5s).
 - **`timeline_view.py <video> <start> <end>`** — filmstrip + waveform PNG. On-demand visual drill-down. **Not a scan tool** — use it at decision points, not constantly.
-- **`render.py <edl.json> -o <out>`** — per-segment extract → concat → overlays (PTS-shifted) → subtitles LAST. `--preview` for 720p fast. `--build-subtitles` to generate master.srt inline.
+- **`render.py <edl.json> -o <out>`** — per-segment extract → concat → overlays (PTS-shifted) → subtitles LAST. `--preview` for 720p fast. `--build-subtitles` to generate master.srt inline. Also auto tone-maps HDR (HLG/PQ) sources to Rec.709 SDR, preserves portrait orientation, and applies two-pass loudnorm (-14 LUFS / -1 dBTP / LRA 11) by default (disable with `--no-loudnorm`).
 - **`grade.py <in> -o <out>`** — ffmpeg filter chain grade. Presets + `--filter '<raw>'` for custom.
+- **`clean_audio.py <video> -o <out>`** — audio-only spectral cleanup: high-pass (default 80 Hz), denoise (`afftdn`), optional `--deess`. Defaults to `--no-loudnorm` (loudness deferred to the music step). Video `-c:v copy`. Gate C step 1.
+- **`audio_bed.py <video> -o <out>`** — ducked music bed (`--music`, sidechain `--duck`) + SFX (`--sfx "file@time:gain"`, repeatable), then loudnorm LAST (-14 LUFS / -1 dBTP / LRA 11). Video `-c:v copy`. Gate C step 2.
+- **`scaffold_hyperframes_pipeline.py --edit-dir <dir>`** — creates `edit/hyperframes/` with DESIGN/SCRIPT/STORYBOARD/QA templates and project folders for the HyperFrames visual pass.
 
 For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a sub-agent via the `Agent` tool.
 
+## HyperFrames Visual Pass
+
+When the user asks for creator-forward motion graphics, layered captions, handwritten notes, logos, screenshots, proof flashes, product UI motion, or a more artistic video-editing pass, read `references/hyperframes-pipeline.md` before planning.
+
+The short version:
+
+- `video-use` owns source inventory, transcript, story selection, EDL, and a clean base cut.
+- HyperFrames owns the visual system, storyboard, composed overlays/captions, validation, and review/final render.
+- The bridge artifacts are `edit/edl.json`, `edit/base-cut.mp4`, `edit/takes_packed.md`, `edit/hyperframes/DESIGN.md`, `edit/hyperframes/SCRIPT.md`, and `edit/hyperframes/STORYBOARD.md`.
+- Do not freestyle a full HyperFrames edit without `DESIGN.md` and `STORYBOARD.md`; those files are the creative contract.
+- For user-visible HyperFrames work, run `lint`, `validate`, `inspect`, snapshots or contact sheet, and a review render before delivery.
+
+## Creator Talking-Head / Yap Videos
+
+For raw yaps, founder takes, personal-brand clips, walk-and-talks, car talks, podcast clips, BTS reels, or any video where the person is the product, read `references/creator-talking-head-workflow.md` before proposing the strategy.
+
+Default operating stance for these videos:
+
+- The editor finds the story; do not make the user supply a full brief.
+- Center the cut around one thesis.
+- Protect the speaker's voice and human rhythm.
+- Generate hook options before committing to a final opening when useful.
+- Keep graphics, captions, memes, proof flashes, and music in service of the message.
+- Leave organized run notes so the content system compounds over time.
+
 ## The process
 
-1. **Inventory.** `ffprobe` every source. `transcribe_batch.py` on the directory. `pack_transcripts.py` to produce `takes_packed.md`. Sample one or two `timeline_view`s for a visual first impression.
-2. **Pre-scan for problems.** One pass over `takes_packed.md` to note verbal slips, obvious mis-speaks, or phrasings to avoid. Plain list, feed into the editor brief.
-3. **Converse.** Describe what you see in plain English. Ask questions *shaped by the material*. Collect: content type, target length/aspect, aesthetic/brand direction, pacing feel, must-preserve moments, must-cut moments, animation and grade preferences, subtitle needs. Do not use a fixed checklist — the right questions are different every time.
-4. **Propose strategy.** 4–8 sentences: shape, take choices, cut direction, animation plan, grade direction, subtitle style, length estimate. **Wait for confirmation.**
-5. **Execute.** Produce `edl.json` via the editor sub-agent brief. Drill into `timeline_view` at ambiguous moments. Build animations in parallel sub-agents. Apply grade per-segment. Compose via `render.py`.
-6. **Preview.** `render.py --preview`.
-7. **Self-eval (before showing the user).** Run `timeline_view` on the **rendered output** (not the sources) at every cut boundary (±1.5s window). Check each image for:
-   - Visual discontinuity / flash / jump at the cut
-   - Waveform spike at the boundary (audio pop that slipped past the 30ms fade)
-   - Subtitle hidden behind an overlay (Rule 1 violation)
-   - Overlay misaligned or showing wrong frames (Rule 4 violation)
+The pipeline runs in three gates. Each gate ends with automated technical QA (the Hard Rules — pops, flashes, caption/overlay alignment) FOLLOWED BY a review with the user. Nothing in a later gate begins until the current gate's checkpoint is approved. QA happens at every gate, not once at the end — so breakage cannot accumulate.
 
-   Also sample: first 2s, last 2s, and 2–3 mid-points — check grade consistency, subtitle readability, overall coherence. Run `ffprobe` on the output to verify duration matches the EDL expectation.
+### Gate A — Story & Cut
 
-   If anything fails: fix → re-render → re-eval. **Cap at 3 self-eval passes** — if issues remain after 3, flag them to the user rather than looping forever. Only present the preview once the self-eval passes.
-8. **Iterate + persist.** Natural-language feedback, re-plan, re-render. Never re-transcribe. Final render on confirmation. Append to `project.md`.
+Lock the words and the rhythm before any visual or audio polish.
+
+1. **Inventory.** `ffprobe` every source. `transcribe_batch.py` on the directory. `pack_transcripts.py` → `takes_packed.md`. Sample one or two `timeline_view`s for a visual first impression.
+2. **Transcript pre-scan.** One pass over `takes_packed.md` as a SHARED read: surface verbal slips, mis-speaks, phrasings to avoid, thesis candidates, hook candidates, proof moments, emotional moments, framework/list moments, proactive clip opportunities. The user reacts; this becomes the editor brief. (Plain list — do not pre-compute stored tags; see Anti-patterns.)
+3. **Converse + filler/long-pause pass.** Describe what you see in plain English and ask questions shaped by the material (content type, target length/aspect, aesthetic/brand, pacing feel, must-preserve/must-cut moments, animation/grade/subtitle prefs). In the same pass, mark obvious fillers and dead pauses LIVE on the transcript — never as pre-computed stored tags (Hard Rule 8 + Anti-patterns) — and propose removals.
+4. **Propose strategy + rough cut.** State the single thesis, story shape, take choices, hook options, and cut-rhythm rules in 4–8 sentences, and WAIT for confirmation (Hard Rule 11). Then produce `edl.json` via the editor sub-agent brief, built around the strongest ideas, drilling into `timeline_view` at ambiguous moments. Render a no-frills base cut (`render.py --preview --no-subtitles --no-loudnorm`, no overlays).
+
+   **→ CHECKPOINT A1 (rough cut).** Run boundary self-eval on the rendered base cut, then watch it with the user. "Does the story land?" Iterate until the story is right.
+
+5. **Tighten pacing.** A SEPARATE cycle, not folded into the rough cut. Trim handoff air, protect breath, cut dead silence, repair choppy thought-jumps. Re-render the base cut.
+
+   **→ CHECKPOINT A2 (tighten) — BLOCKS GATE B.** Review the tightened cut with the user. No visual or audio work begins until this checkpoint is approved.
+
+### Gate B — Picture Lock
+
+6. **Captions.** Choose chunking / case / placement for the content. Build via `render.py --build-subtitles` (or a hand-authored SRT). Hard Rule 1 (subtitles LAST) and Hard Rule 5 (output-timeline offsets) are enforced by `render.py`.
+7. **B-roll / screenshots / overlays.** HyperFrames (read `references/hyperframes-pipeline.md` first) or PIL / Remotion / Manim slots, built in parallel sub-agents (Hard Rule 10). Compose via `render.py` — overlays PTS-shifted (Rule 4), subtitles last (Rule 1). For talking-head/yap edits the base cut must already work without graphics (Gate A) before anything here.
+
+   **→ CHECKPOINT B (picture lock).** Render with visuals (`--no-loudnorm` — Gate C owns final audio). Self-eval every overlay boundary: captions not hidden, overlays PTS-aligned, no flashes. Review with the user. "Does it look right?" This is picture lock.
+
+### Gate C — Audio & Polish
+
+The audio chain runs as audio-only passes on the picture-locked file. Video stays `-c:v copy` throughout (Hard Rule 13).
+
+8. **Clean audio.** `clean_audio.py <picture_lock.mp4> -o <cleaned.mp4>` — high-pass rumble, denoise, optional de-ess. Run with `--no-loudnorm` (loudness is deferred to the music step).
+9. **SFX / light music.** `audio_bed.py <cleaned.mp4> -o <mixed.mp4> [--music <file> --duck] [--sfx "file@time:gain" ...]` — ducked music bed under speech, SFX placed on the output timeline, then loudnorm LAST (-14 LUFS / -1 dBTP / LRA 11). If there is no music or SFX, skip `audio_bed.py` and let `render.py`'s built-in loudnorm finish instead (do not pass `--no-loudnorm` on the final render).
+10. **Clarity & energy review.** A CREATIVE review, not just technical: is it tight, alive, on-message? Run the technical self-eval too.
+
+   **→ CHECKPOINT C (final).** Review with the user. Final render on approval. Append `project.md` (see the Memory section).
+
+### Self-eval (runs inside every checkpoint, before showing the user)
+
+Run `timeline_view` on the RENDERED output (not the sources) at every cut boundary (±1.5s) and check each frame for: visual discontinuity / flash / jump; waveform spike (audio pop past the 30ms fade); subtitle hidden behind an overlay (Rule 1); overlay misaligned or showing wrong frames (Rule 4); for talking-head/yap, choppy thought-jumps or missing breath. Also sample first 2s, last 2s, and 2–3 mid-points for grade consistency and caption readability. `ffprobe` the output to confirm duration matches the EDL. If anything fails: fix → re-render → re-eval. Cap at 3 self-eval passes per checkpoint — if issues remain after 3, flag them to the user rather than looping forever. Only present a checkpoint once its self-eval passes.
 
 ## Cut craft (techniques)
 
@@ -177,22 +231,20 @@ Hard rules: apply **per-segment during extraction** (not post-concat, which re-e
 
 ## Subtitles (when requested)
 
-Subtitles have three dimensions worth reasoning about: **chunking** (1/2/3/sentence per line), **case** (UPPER/Title/Natural), and **placement** (margin from bottom). The right combo depends on content.
+Subtitles have three dimensions worth reasoning about: **chunking** (how much text per cue), **case** (Natural/Title/UPPER), and **placement** (margin from bottom). The right combo depends on content.
 
-**Worked styles** — pick, adapt, or invent:
+**Chunking — one phrase at a time.** Captions exist to convey meaning, so show **one clean phrase per cue**, usually **3–5 words at a time**. Each line should read well on its own as the viewer scans it. `render.py`'s `build_master_srt` prefers punctuation and clause boundaries when they land inside that 3–5 word window; otherwise it splits at the word/character cap while avoiding dangling connectors at the end of a line. Avoid 1–2 word fragments unless the source phrase is genuinely that short, e.g. "Why?". Default to **natural case**, not all-caps walls.
 
-**`bold-overlay`** — short-form tech launch, fast-paced social. 2-word chunks, UPPERCASE, break on punctuation, Helvetica 18 Bold, white-on-outline, `MarginV=35`. `render.py` ships with this as `SUB_FORCE_STYLE`.
+**Default style** — `render.py` ships this as `SUB_FORCE_STYLE`: TikTok Sans Bold, white text, **no caption background**, and **no black outline on the letters**. `MarginV=80` for vertical-social safe-zone; drop to `~34` for landscape/desktop deliverables. TikTok Sans is the default caption font for all video-use renders unless the user explicitly asks for a different font.
 
 ```
-FontName=Helvetica,FontSize=18,Bold=1,
+FontName=TikTok Sans,FontSize=18,Bold=1,
 PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H00000000,
-BorderStyle=1,Outline=2,Shadow=0,
-Alignment=2,MarginV=35
+BorderStyle=1,Outline=0,Shadow=0,
+Alignment=2,MarginV=80
 ```
 
-**`natural-sentence`** (if you invent this mode) — narrative, documentary, education. 4–7 word chunks, sentence case, break on natural pauses, `MarginV=60–80`, larger font for readability, slightly wider max-width. No shipped force_style — design one if you need it.
-
-Invent a third style if neither fits. Hard rules: subtitles LAST (Rule 1), output-timeline offsets (Rule 5).
+Adapt freely when the user asks for a specific style, but the default is phrase-level TikTok Sans with no box and no outline. Hard rules: subtitles LAST (Rule 1), output-timeline offsets (Rule 5).
 
 ## Animations (when requested)
 
@@ -320,3 +372,5 @@ Things that consistently fail regardless of style:
 - **Editing before confirming the strategy.** Never.
 - **Re-transcribing cached sources.** Immutable outputs of immutable inputs.
 - **Assuming what kind of video it is.** Look first, ask second, edit last.
+- **Re-encoding video during the audio pass.** Audio cleanup, music, and SFX are audio-only — keep `-c:v copy`. (Hard Rule 13.)
+- **Loudnorm before adding music.** Music changes integrated loudness; loudnorm runs LAST. (Hard Rule 13.)
